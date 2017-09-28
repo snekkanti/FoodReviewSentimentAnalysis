@@ -1,0 +1,365 @@
+---
+title: "Food Reviews Sentiment Analysis and Prediction Model"
+author: "Shiva Nekkanti"
+date: "September 27, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+packages <- c("xgboost", "ROCR", "caret", "png", "dplyr", "RTextTools", "textcat", "tidytext", "RTextTools", "data.table", "readr", "tm", "wordcloud", "png", "DBI", "RSQLite", "ggplot2", "scales", "knitr")
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+
+library(data.table)
+library(dplyr)
+library(caret)
+library(RTextTools)
+library(xgboost)
+library(ROCR)
+library(readr)
+library(tm)
+library(wordcloud)
+library(png)
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(tidytext)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Motivation
+
+The motivation behing this analysis is to build a prediction model where we will able to predict whether a recommendation is positive or negative. We will not use score but rather we will use review text to build a term-doc incidence matrix using term frequency and inverse document frequency. And using the DTM data, we will build the predictive model.
+
+## Data Source
+
+In this project we will using Amazon Fine Food reviews which is available in different formats like SQLITE and CSV. We will be using SQLITE driver to read the dataset and will limit to 10K reviews. 
+
+```{r echo=FALSE}
+setwd("~/MachineLearning/FoodReviewSentimentAnalysis")
+con = dbConnect(SQLite(), dbname="database.sqlite")
+# get a list of all tables
+alltables = dbListTables(con)
+# get the Reviews as a data.frame
+allreviews = dbGetQuery( con,'select * from Reviews LIMIT 10000' )
+summary(allreviews)
+```
+
+
+
+## Exploratory Data Analysis
+
+Let us start by looking at the distribution of ratings by using Score.
+
+```{r allreviews, echo=FALSE}
+barplot(table(as.factor(allreviews$Score)),
+        ylim = c(0,10000),
+        main = "Distribution of ratings")
+```
+
+
+#### Distribution of review text length by rating.
+
+
+```{r, echo=FALSE}
+ggplot(allreviews, aes(x=as.factor(allreviews$Score), y=nchar(allreviews$Text))) +
+  geom_boxplot(fill="slateblue", alpha=0.2) +
+  ylim(0, 2000) +
+  xlab("Ratings") +
+  ylab( "Review Text Length" )
+```
+
+
+
+####Distribution of score with time in year
+
+
+```{r, echo=FALSE}
+reviewTime <- as.POSIXct(as.numeric(allreviews$Time), origin = '1970-01-01', tz = 'GMT')
+allreviews$Time <- reviewTime
+tmp <- allreviews %>% group_by(Time, Score) %>% summarise(totScore = n()) 
+ggplot(tmp, aes(Time,Score,color=as.factor(totScore))) + geom_point(aes(size=totScore))
+```
+
+
+## Sentiment Analysis using tidytext Package
+
+
+We will now be using “positive” or “negative” aspect of words from the sentiments dataset within the tidytext package, to see if it correlates with the ratings. In order to do that, we need to start by establishing lexicons of words with a positive/negative score.
+
+
+```{r, echo=FALSE}
+AFINN <- sentiments %>%
+  filter(lexicon == "AFINN") %>%
+  select(word, afinn_score = score)
+kable(AFINN[1:5, ], caption = "AFINN Lexicon", )
+Bing <- sentiments %>%
+  filter(lexicon == "bing") %>%
+  select(word, bing_sentiment = sentiment)
+kable(Bing[1:5, ], caption = "Bing Lexicon" )
+```
+
+
+We then tidy up our dataset by making it one word per row and add the sentiment scores for each word
+
+Here is how the data looks like
+
+
+```{r, echo=FALSE}
+food_review_words <- allreviews %>%
+  unnest_tokens(word, Text) %>%
+  select(-c(Summary, HelpfulnessNumerator,HelpfulnessDenominator)) %>%
+  left_join(AFINN, by = "word") %>%
+  left_join(Bing, by = "word")
+kable(food_review_words[1:5, ], caption = "Sentiment score per word in the review" )
+```
+
+Grouping by mean for observation.
+Here is how the average sentiment score vary by rating looks like
+
+
+```{r, echo=FALSE}
+  review_mean_sentiment <- food_review_words %>%
+    group_by(Id, Score) %>%
+    summarize(mean_sentiment = mean(afinn_score, na.rm = TRUE))
+  theme_set(theme_bw())
+  ggplot(review_mean_sentiment, aes(Score, mean_sentiment, group = Score)) + 
+    geom_boxplot() +
+    ylab("Average sentiment score")
+  review_mean_sentiment <- review_mean_sentiment %>%
+  select(-Score) %>%
+  data.table()
+  cleaned_food_reviews_data <- allreviews %>%
+  left_join(review_mean_sentiment, by = "Id")
+```
+
+
+The difference between ratings is even clearer if we take the median score instead of the mean:
+
+
+```{r, echo=FALSE}
+review_median_sentiment <- food_review_words %>%
+  group_by(Id, Score) %>%
+  summarize(median_sentiment = median(afinn_score, na.rm = TRUE))
+theme_set(theme_bw())
+ggplot(review_median_sentiment, aes(Score, median_sentiment, group = Score)) +
+  geom_boxplot() +
+  ylab("Median sentiment score")
+review_median_sentiment <- review_median_sentiment %>%
+  select(-Score) %>%
+  data.table()
+cleaned_food_reviews_data <- cleaned_food_reviews_data %>%
+  left_join(review_median_sentiment, by = "Id")
+```
+
+
+We are going to count the number of negative and positive words in each review, according to the two lexicons for use in the machine learning algorithm.
+
+#### Counting the number of negative words per review according to AFINN lexicon
+
+
+```{r, echo=FALSE}
+review_count_afinn_negative <- food_review_words %>%
+  filter(afinn_score < 0) %>%
+  group_by(Id, Score) %>%
+  summarize(count_afinn_negative = n())
+review_count_afinn_negative <- review_count_afinn_negative %>%
+  select(-Score) %>%
+  data.table()
+cleaned_food_reviews_data <- cleaned_food_reviews_data %>%
+  left_join(review_count_afinn_negative, by = "Id")
+
+kable(review_count_afinn_negative[1:5, ], caption = "AFINN Negative words per review" )
+```
+
+
+#### Counting the number of positive words per review according to AFINN lexicon
+
+```{r, echo=FALSE}
+review_count_afinn_positive <- food_review_words %>%
+  filter(afinn_score > 0) %>%
+  group_by(Id, Score) %>%
+  summarize(count_afinn_positive = n())
+review_count_afinn_positive <- review_count_afinn_positive %>%
+  select(-Score) %>%
+  data.table()
+cleaned_food_reviews_data <- cleaned_food_reviews_data %>%
+  left_join(review_count_afinn_positive, by = "Id")
+kable(review_count_afinn_positive[1:5, ], caption = "AFINN Positive words per review" )
+```
+
+
+
+#### Counting the number of negative words per review according to BING lexicon
+
+```{r, echo=FALSE}
+review_count_bing_negative <- food_review_words %>%
+  filter(bing_sentiment == "negative" ) %>%
+  group_by(Id, Score) %>%
+  summarize(count_bing_negative = n())
+review_count_bing_negative <- review_count_bing_negative %>%
+  select(-Score) %>%
+  data.table()
+cleaned_food_reviews_data <- cleaned_food_reviews_data %>%
+  left_join(review_count_bing_negative, by = "Id")
+kable(review_count_bing_negative[1:5, ], caption = "Bing Negative words per review" )
+
+```
+
+
+
+#### Counting the number of positive words per review according to BING lexicon
+
+
+```{r, echo=FALSE}
+review_count_bing_positive <- food_review_words %>%
+  filter(bing_sentiment == "positive") %>%
+  group_by(Id, Score) %>%
+  summarize(count_bing_positive = n())
+review_count_bing_positive <- review_count_bing_positive %>%
+  select(-Score) %>%
+  data.table()
+cleaned_food_reviews_data <- cleaned_food_reviews_data %>%
+  left_join(review_count_bing_positive, by = "Id")
+kable(review_count_bing_positive[1:5, ], caption = "Bing Positive words per review" )
+```
+
+
+## Machine Learning
+
+We will simplify the analysis by collapsing the 1 to 5 stars rating into a binary variable: whether the book was rated a “good read” (4 or 5 stars) or not (1 to 3 stars). This will allow us to use classification algorithms, and to have less unbalanced categories.
+
+
+#### Creating the Document-Term Matrices (DTM)
+
+
+Goal is to use the frequency of individual words in the reviews as features in this machine learning algorithm. In order to do that, we will start by counting the number of occurrence of each word in each review. We will use a package that will return a “Document-Term Matrix”, with the reviews in rows and the words in columns. Each entry in the matrix indicates the number of occurrences of that particular word in that particular review.
+
+We also want to use in our analyses our aggregate variables (review length, mean and median sentiment, count of positive and negative words according to the two lexicons), so we join the DTM to the train dataset, by review id. We also convert all NA values in our data frames to 0 (these NA have been generated where words were absent of reviews, so that’s the correct of dealing with them here).
+
+```{r, echo = FALSE}
+data <- read.csv("FoodReviewsCleanData.csv", stringsAsFactors = FALSE)
+data$good.read <- 0
+data$good.read[data$Score == 4 | data$Score == 5] <- 1
+
+trainIdx <- createDataPartition(data$good.read, 
+                                p = .75,
+                                list = FALSE,
+                                times = 1)
+train <- data[trainIdx, ]
+test <- data.table(data[-trainIdx, ])
+
+sparsity <- .99
+bad.dtm <- create_matrix(train$Text[train$good.read == 0], 
+                         language = "english",
+                         removeStopwords = FALSE, 
+                         removeNumbers = TRUE,
+                         stemWords = FALSE, 
+                         removeSparseTerms = sparsity) 
+
+bad.dtm.df  <-  data.table(as.matrix(bad.dtm))
+good.dtm <- create_matrix(train$Text[train$good.read == 1], 
+                          language="english",
+                          removeStopwords = FALSE, 
+                          removeNumbers = TRUE,
+                          stemWords = FALSE, 
+                          removeSparseTerms = sparsity) 
+good.dtm.df <- data.table(as.matrix(good.dtm))
+train.dtm.df <- bind_rows(bad.dtm.df, good.dtm.df)
+train.dtm.df$Id <- c(train$Id[train$good.read == 0],
+                            train$Id[train$good.read == 1])
+train.dtm.df <- arrange(train.dtm.df, Id)
+train.dtm.df$good.read  <- train$good.read
+
+train.dtm.df <- train %>%
+  select(-c(HelpfulnessNumerator, HelpfulnessDenominator, Score, Time, Summary, Text, good.read)) %>%
+  inner_join(train.dtm.df, by = "Id") %>%
+  select(-Id)
+
+train.dtm.df[is.na(train.dtm.df)] <- 0
+
+test.dtm <- create_matrix(test$Text, 
+                          language = "english", 
+                          removeStopwords = FALSE, 
+                          removeNumbers = TRUE, 
+                          stemWords = FALSE, 
+                          removeSparseTerms = sparsity) 
+test.dtm.df <- data.table(as.matrix(test.dtm))
+test.dtm.df$Id <- test$Id
+test.dtm.df$good.read <- test$good.read
+
+test.dtm.df <- test %>%
+  select(-c(HelpfulnessNumerator, HelpfulnessDenominator, Score, Time, Summary, Text, good.read)) %>%
+  inner_join(test.dtm.df, by = "Id") %>%
+  select(-Id)
+
+test.dtm.df <- head(bind_rows(test.dtm.df, train.dtm.df[1, ]), -1)
+test.dtm.df <- test.dtm.df %>% 
+  select(one_of(colnames(train.dtm.df)))
+test.dtm.df[is.na(test.dtm.df)] <- 0
+test.dtm.df <- data.table(test.dtm.df)
+
+
+baseline.acc <- sum(test$good.read == "1") / nrow(test)
+```
+
+
+Here is our out DTM will look ike
+
+```{r, echo=FALSE}
+kable(test.dtm.df[1:5, ], caption = "Document-Term Matrices" )
+```
+
+
+We’ll be using XGboost and start calculating our baseline accuracy, what would get by always predicting the most frequent category, and then we calibrate our model.
+
+The XGBoost algorithm yields a probabilist prediction, so we need to determine a threshold over which we’ll classify a review as good. In order to do that, we’ll plot the ROC (Receiver Operating Characteristic) curve for the true negative rate against the false negative rate.
+
+
+
+```{r, echo=FALSE}
+XGB.train <-  as.matrix(select(train.dtm.df, -good.read),
+                        dimnames = dimnames(train.dtm.df))
+XGB.test <- as.matrix(select(test.dtm.df, -good.read),
+                      dimnames = dimnames(test.dtm.df))
+XGB.model <- xgboost(data = XGB.train, 
+                     label = train.dtm.df$good.read, 
+                     nrounds = 400, 
+                     objective = "binary:logistic",
+                     verbose = 0)
+
+XGB.predict <- predict(XGB.model, XGB.test)
+
+XGB.results <- data.frame(good.read = test$good.read, pred = XGB.predict)
+
+ROCR.pred <- prediction(XGB.results$pred, XGB.results$good.read)
+ROCR.perf <- performance(ROCR.pred, 'tnr','fnr') 
+plot(ROCR.perf, colorize = TRUE)
+```
+
+## Conclusion
+
+Using a threshold of about 0.8, where the curve becomes red, we can correctly classify more than 50% of the negative reviews (the true negative rate) while misclassifying as negative reviews less than 10% of the positive reviews (the false negative rate).
+
+Our overall accuracy is 87%, so we beat the benchmark of always predicting that a review is positive, while catching 61.5% of the negative reviews. 
+
+## Feature Improvments 
+
+There are several ways we could improve on the analysis at this point, such as:
+
+
+1) Using N-grams (that is, sequences of words, such as “did not like”) in addition to single words, to better qualify negative terms. “was very disappointed” would obviously have a different impact compared to “was not disappointed”, even though on a word-by-word basis they could not be distinguished.
+
+2) Fine-tuning the parameters of the XGBoost algorithm.
+
+3) Looking at the negative reviews that have been misclassified, in order to determine what features to add to the analysis.
+
+```{r, echo=FALSE}
+names <- colnames(test.dtm.df)
+importance.matrix <- xgb.importance(names, model = XGB.model)
+xgb.plot.importance(importance.matrix[1:20, ])
+```

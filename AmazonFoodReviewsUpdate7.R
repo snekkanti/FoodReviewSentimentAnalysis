@@ -21,7 +21,7 @@ library(textcat)
 library(tidytext)
 library(RTextTools)
 library(ztable)
-setwd("~/Box Sync/FoodReviews")
+setwd("~/MachineLearning/FoodReviewSentimentAnalysis")
 con = dbConnect(SQLite(), dbname="database.sqlite")
 # get a list of all tables
 alltables = dbListTables(con)
@@ -151,5 +151,5 @@ cleaned_food_reviews <- cleaned_food_reviews %>%
   left_join(review_count_bing_positive, by = "Id")
 
 # Writing the data to file for future analyses
-write.csv(cleaned_food_reviews, "FoodReviewsCleanData.csv", row.names = FALSE)
+write.csv(cleaned_food_reviews, "FoodReviewsCleanData2.csv", row.names = FALSE)
 
